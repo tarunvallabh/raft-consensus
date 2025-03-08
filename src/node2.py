@@ -4,7 +4,9 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify
 import requests
-
+import os
+import json
+import time
 
 node = None
 
@@ -60,8 +62,8 @@ class Node:
 
         self.executor = ThreadPoolExecutor(max_workers=10)
 
-        # LOCK
-        self.lock = threading.Lock()
+        # LOCK, allow for re-entrant locks
+        self.lock = threading.RLock()
 
         self.other_nodes = []
         for i, address in enumerate(self.config["addresses"]):
@@ -80,6 +82,33 @@ class Node:
         self.election_timer = RPCTimer(self.id, self.start_election, (500, 1000))
         # start our election timer
         self.election_timer.timer.start()
+
+    ### Persistent State
+    def save_state(self):
+        """Save persistent state to disk"""
+        with self.lock:
+            os.makedirs("node", exist_ok=True)
+            persistent_state = {
+                "currentTerm": self.current_term,
+                "votedFor": self.voted_for,
+                "log": self.log,
+            }
+
+        with open(f"node/{self.id}.json", "w") as f:
+            json.dump(persistent_state, f)
+
+    def load_state(self):
+        """Load persistent state from disk"""
+        try:
+            with open(f"node/{self.id}.json", "r") as f:
+                persistent_state = json.load(f)
+
+            with self.lock:
+                self.current_term = persistent_state["currentTerm"]
+                self.voted_for = persistent_state["votedFor"]
+                self.log = persistent_state["log"]
+        except FileNotFoundError:
+            print(f"Node {self.id}: No persisted state found, using defaults")
 
     def start_election(self):
         with self.lock:
@@ -127,21 +156,11 @@ class Node:
         self.send_heartbeat()
 
     def send_heartbeat(self):
-        with self.lock:
-            current_prev_log_index = len(self.log)
-            # Use an empty list for entries if there are no new log entries
-            heartbeat_entries = []
-
         print(f"Node {self.id}: Sending heartbeat for term {self.current_term}")
 
         # Submit heartbeat tasks for each follower (using self.other_nodes)
         for each_node in self.other_nodes:
-            self.executor.submit(
-                self.send_append_entries_to_node,
-                each_node,
-                current_prev_log_index,
-                heartbeat_entries,
-            )
+            self.executor.submit(self.send_append_entries_to_node, each_node)
 
         # Reset the heartbeat timer after sending heartbeats
         with self.lock:
@@ -178,7 +197,11 @@ class Node:
                 self.current_role = "Follower"
 
             # If we haven't voted for anyone in this term yet (or already voted for this candidate)
-            if self.voted_for is None or self.voted_for == candidate_id:
+            last_log_index = data.get("last_log_index", 0)
+            last_log_term = data.get("last_log_term", 0)
+            if (
+                self.voted_for is None or self.voted_for == candidate_id
+            ) and self.is_candidate_log_up_to_date(last_log_index, last_log_term):
                 print(
                     f"Node {self.id}: Granting vote to {candidate_id} for term {candidate_term}"
                 )
@@ -187,6 +210,7 @@ class Node:
 
                 # Reset election timeout
                 self.election_timer.reset_timer()
+
             else:
                 print(
                     f"Node {self.id}: Rejecting vote - already voted for {self.voted_for}"
@@ -281,20 +305,60 @@ class Node:
                 self.heartbeat_timer.stop_timer()
             self.current_role = "Follower"
 
+            # Rule 2: check if we have the log entry at prev_log_index and the term matches
+            if prev_log_index > 0:
+                if prev_log_index > len(self.log) or (
+                    len(self.log) >= prev_log_index
+                    and self.log[prev_log_index - 1]["term"] != prev_log_term
+                ):
+                    print(
+                        f"Node {self.id}: Rejecting append entries - log mismatch at index {prev_log_index}"
+                    )
+                    return {"term": self.current_term, "success": False}
+
+            # Rule 3 and 4: now, we've passed the checks so we can start applying the entry!
+            # if the existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
+            if len(entries) > 0:
+                if len(self.log) > prev_log_index:
+                    # truncate the log if our log is longer than the leader's
+                    self.log = self.log[:prev_log_index]
+                self.log.extend(entries)
+
+            # Rule 5: update commit index
+            if leader_commit > self.commit_index:
+                old_commit_index = self.commit_index
+                self.commit_index = min(leader_commit, len(self.log))
+                # if the commit index has changed, apply the log entries
+                if old_commit_index != self.commit_index:
+                    self.apply_committed_entries()
+
             response["term"] = self.current_term
             response["success"] = True
 
             return response
 
-    def send_append_entries_to_node(self, target_node, prev_log_index, entries):
+    def send_append_entries_to_node(self, target_node):
         """Send an AppendEntries RPC to a target node"""
         try:
             with self.lock:
                 if self.current_role != "Leader":
                     return
+
+                follower_id = target_node["id"]
+                next_idx = self.next_index.get(follower_id, 1)
+                # this is the index of the log entry immediately preceding new entries
+                prev_log_index = next_idx - 1
+
+                # get the term:
                 prev_log_term = 0
                 if prev_log_index > 0 and prev_log_index <= len(self.log):
                     prev_log_term = self.log[prev_log_index - 1]["term"]
+
+                # if we have entries to send, get the entries from the log
+                if next_idx <= len(self.log):
+                    entries = self.log[next_idx - 1 :]
+                else:
+                    entries = []
 
                 request_data = {
                     "term": self.current_term,
@@ -335,10 +399,128 @@ class Node:
                             match_index = prev_log_index + len(entries)
                             self.next_index[target_node["id"]] = next_index
                             self.match_index[target_node["id"]] = match_index
+                            # update commit index. We call this every heartbeat, but it's only applied if the commit index has changed
+                            self.update_commit_index()
+                    elif (self.current_role == "Leader") and (
+                        leader_term == self.current_term
+                    ):
+                        # decrement the next index and retry
+                        if self.next_index.get(target_node["id"], 1) > 1:
+                            self.next_index[target_node["id"]] -= 1
+
         except requests.exceptions.RequestException:
             print(
                 f"Node {self.id}: Error sending append entries to {target_node['id']}"
             )
+
+    def apply_committed_entries(self):
+        """Apply all committed entries to the state machine"""
+        with self.lock:
+            while self.last_applied < self.commit_index:
+                # increment last_applied
+                self.last_applied += 1
+                # get the log entry
+                entry = self.log[self.last_applied - 1]
+                command = entry["command"]
+                print(
+                    f"Node {self.id}: Applying command {command} (entry {self.last_applied})"
+                )
+
+                # apply the command to the state machine
+                if command == "ADD_TOPIC":
+                    topic = entry["topic"]
+                    if topic not in self.topics:
+                        self.topics[topic] = []
+                        print(f"Node {self.id}: Added topic {topic}")
+                elif command == "PUT_MESSAGE":
+                    topic = entry["topic"]
+                    message = entry["message"]
+                    if topic in self.topics:
+                        self.topics[topic].append(message)
+                        print(
+                            f"Node {self.id}: Added message to topic {topic}: {message}"
+                        )
+                elif command == "GET_MESSAGE":
+                    topic = entry["topic"]
+                    if topic in self.topics and len(self.topics[topic]) > 0:
+                        message = self.topics[topic].pop(0)
+                        print(
+                            f"Node {self.id}: Retrieved message from topic {topic}: {message}"
+                        )
+
+    def update_commit_index(self):
+        """Update commit index if there exists an N > commitIndex such that
+        a majority of matchIndex[i] ≥ N and log[N].term == currentTerm"""
+        with self.lock:
+            if self.current_role != "Leader":
+                return
+
+            # Check each index from current commit_index+1 to end of log
+            old_commit_index = self.commit_index
+            for N in range(self.commit_index + 1, len(self.log) + 1):
+                # Only update commit_index for entries from current term
+                if self.log[N - 1]["term"] == self.current_term:
+                    # Count how many servers have this entry (including self)
+                    replicated_count = 1  # Count self
+                    for each_follower in self.match_index:
+                        if self.match_index[each_follower] >= N:
+                            replicated_count += 1
+
+                    # If majority have this entry, update commit_index
+                    if replicated_count > (self.total_nodes // 2):
+                        self.commit_index = N
+                    else:
+                        # If we don't have majority for this entry, we won't for later ones either
+                        break
+
+            # If commit index changed, apply entries
+            if self.commit_index > old_commit_index:
+                print(
+                    f"Node {self.id}: Commit index updated from {old_commit_index} to {self.commit_index}"
+                )
+                self.apply_committed_entries()
+
+    def is_candidate_log_up_to_date(self, last_log_index, last_log_term):
+        """Check if candidate's log is at least as up-to-date as receiver's log"""
+        my_last_log_term = 0
+        my_last_log_index = len(self.log)
+        if self.log:
+            my_last_log_term = self.log[-1]["term"]
+
+        # If the terms are different, the one with the larger term is more up-to-date
+        if last_log_term > my_last_log_term:
+            return True
+        elif last_log_term == my_last_log_term:
+            # If terms are the same, the one with the longer log is more up-to-date
+            return last_log_index >= my_last_log_index
+        return False
+
+    def wait_for_log_commit(self, log_index):
+        """Wait until the specified log entry has been committed and applied"""
+        majority = (self.total_nodes // 2) + 1
+
+        while True:
+            with self.lock:
+                # Already committed?
+                if self.commit_index >= log_index:
+                    return
+
+                # Count nodes that have replicated this entry
+                confirmed_count = 1  # Leader counts as confirmed
+                for follower_id in self.match_index:
+                    if self.match_index[follower_id] >= log_index:
+                        confirmed_count += 1
+
+                # If majority confirmed, update commit_index and apply
+                if confirmed_count >= majority:
+                    # We can use update_commit_index here, but let's be direct
+                    old_commit_index = self.commit_index
+                    self.commit_index = log_index
+                    self.apply_committed_entries()
+                    return
+
+            # Brief sleep to avoid CPU hogging
+            time.sleep(0.005)
 
 
 # RPC Endpoints
@@ -364,7 +546,14 @@ def create_topic():
     with node.lock:
         if topic in node.topics:
             return jsonify({"success": False}), 409
-        node.topics[topic] = []  # Create a new empty message queue for the topic
+        log_index = len(node.log) + 1
+        node.log.append(
+            {"term": node.current_term, "command": "ADD_TOPIC", "topic": topic}
+        )
+
+    node.send_heartbeat()
+    # update commit index
+    node.wait_for_log_commit(log_index)
 
     print(f"Node {node.id}: Created topic '{topic}'")
     return jsonify({"success": True}), 201
@@ -373,6 +562,8 @@ def create_topic():
 @app.route("/topic", methods=["GET"])
 def list_topics():
     with node.lock:
+        if node.current_role != "Leader":
+            return jsonify({"success": False}), 400
         topics = list(node.topics.keys())
     return jsonify({"success": True, "topics": topics}), 200
 
@@ -392,7 +583,21 @@ def put_message():
     with node.lock:
         if topic not in node.topics:
             return jsonify({"success": False}), 404
-        node.topics[topic].append(message)
+        log_index = len(node.log) + 1
+        node.log.append(
+            {
+                "command": "PUT_MESSAGE",
+                "topic": topic,
+                "message": message,
+                "term": node.current_term,
+            }
+        )
+
+    # Trigger replication
+    node.send_heartbeat()
+
+    # Update commit index based on replication status
+    node.wait_for_log_commit(log_index)
 
     print(f"Node {node.id}: Added message to topic '{topic}': {message}")
     return jsonify({"success": True}), 201
@@ -406,8 +611,24 @@ def get_message(topic):
             return jsonify({"success": False}), 400
         if topic not in node.topics or len(node.topics[topic]) == 0:
             return jsonify({"success": False}), 404
-        # FIFO: pop the first message
-        message = node.topics[topic].pop(0)
+
+        # Save the message to return before it gets popped
+        message = node.topics[topic][0]
+
+        # add to log, so we can pop later
+        log_index = len(node.log) + 1
+        node.log.append(
+            {
+                "command": "GET_MESSAGE",
+                "topic": topic,
+                "term": node.current_term,
+            }
+        )
+
+    # Trigger replication
+    node.send_heartbeat()
+    # Update commit index based on replication status
+    node.wait_for_log_commit(log_index)
 
     print(f"Node {node.id}: Retrieved message from topic '{topic}': {message}")
     return jsonify({"success": True, "message": message}), 200
