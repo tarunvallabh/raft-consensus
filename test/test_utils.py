@@ -5,6 +5,9 @@ import time
 import requests
 import socket
 
+import os
+import shutil
+
 
 MESSAGE = "/message"
 TOPIC = "/topic"
@@ -20,7 +23,13 @@ REQUEST_TIMEOUT = 1
 
 
 class Node:
-    def __init__(self,  program_file_path: str, config_path: str, i: int, config: dict, ):
+    def __init__(
+        self,
+        program_file_path: str,
+        config_path: str,
+        i: int,
+        config: dict,
+    ):
         self.config = config
         self.i = i
         self.address = self.get_address()
@@ -28,10 +37,12 @@ class Node:
         self.config_path = config_path
 
     def start(self):
-        self.startup_sequence = ["python3",
-                                 self.program_file_path,
-                                 self.config_path,
-                                 str(self.i)]
+        self.startup_sequence = [
+            "python3",
+            self.program_file_path,
+            self.config_path,
+            str(self.i),
+        ]
         self.process = Popen(self.startup_sequence)
         self.wait_for_flask_startup()
         self.pid = self.process.pid
@@ -72,18 +83,20 @@ class Node:
                 return requests.get(self.address)
             except requests.exceptions.ConnectionError:
                 time.sleep(0.1)
-        raise Exception('Cannot connect to server')
+        raise Exception("Cannot connect to server")
 
     def get_address(self):
         address = self.config["addresses"][self.i]
-        return "http://" + address["ip"]+":"+str(address["port"])
+        return "http://" + address["ip"] + ":" + str(address["port"])
 
     def put_message(self, topic: str, message: str):
         data = {"topic": topic, "message": message}
-        return requests.put(self.address + MESSAGE, json=data,  timeout=REQUEST_TIMEOUT)
+        return requests.put(self.address + MESSAGE, json=data, timeout=REQUEST_TIMEOUT)
 
     def get_message(self, topic: str):
-        return requests.get(self.address + MESSAGE + '/' + topic,  timeout=REQUEST_TIMEOUT)
+        return requests.get(
+            self.address + MESSAGE + "/" + topic, timeout=REQUEST_TIMEOUT
+        )
 
     def create_topic(self, topic: str):
         data = {"topic": topic}
@@ -102,10 +115,12 @@ class Swarm:
 
         # create the config
         config = self.make_config()
-        dump(config, open(CONFIG_PATH, 'w'))
+        dump(config, open(CONFIG_PATH, "w"))
 
-        self.nodes = [Node(program_file_path, CONFIG_PATH, i, config)
-                      for i in range(self.num_nodes)]
+        self.nodes = [
+            Node(program_file_path, CONFIG_PATH, i, config)
+            for i in range(self.num_nodes)
+        ]
 
     def start(self, sleep=0):
         for node in self.nodes:
@@ -128,14 +143,19 @@ class Swarm:
         time.sleep(sleep)
 
     def make_config(self):
-        return {"addresses": [{"ip": IP, "port": get_free_port(), "internal_port": get_free_port()} for i in range(self.num_nodes)]}
+        return {
+            "addresses": [
+                {"ip": IP, "port": get_free_port(), "internal_port": get_free_port()}
+                for i in range(self.num_nodes)
+            ]
+        }
 
     def get_status(self):
         statuses = {}
         for node in self.nodes:
             try:
                 response = node.get_status()
-                if (response.ok):
+                if response.ok:
                     statuses[node.i] = response.json()
             except requests.exceptions.ConnectionError:
                 continue
@@ -145,7 +165,7 @@ class Swarm:
         for node in self.nodes:
             try:
                 response = node.get_status()
-                if (response.ok and response.json()["role"] == LEADER):
+                if response.ok and response.json()["role"] == LEADER:
                     return node
             except requests.exceptions.ConnectionError:
                 continue
@@ -162,10 +182,16 @@ class Swarm:
     def __getitem__(self, key):
         return self.nodes[key]
 
+    def remove_persistent_state(self):
+        """Remove all persistent state files"""
+        if os.path.exists("node"):
+            shutil.rmtree("node")
+        os.makedirs("node", exist_ok=True)
+
 
 def get_free_port():
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(('', 0))
+    s.bind(("", 0))
     addr = s.getsockname()
     s.close()
     return addr[1]

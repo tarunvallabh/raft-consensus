@@ -1,542 +1,761 @@
-from flask import Flask, request, jsonify
-import json
-import sys
-import time
 import random
+from threading import Timer
 import threading
-import requests
 from concurrent.futures import ThreadPoolExecutor
+from flask import Flask, request, jsonify
+import requests
+import os
+import json
+import time
+import signal
+import sys
+import shutil
+
+node = None
+PERSISTENT_STATE_DIR = "../test/node"
 
 
-# Flask app
+def clean_persistent_state():
+    if os.path.exists(PERSISTENT_STATE_DIR):
+        shutil.rmtree(PERSISTENT_STATE_DIR)
+    os.makedirs(PERSISTENT_STATE_DIR, exist_ok=True)
+
+
+# reference: https://avi.im/blag/2016/sigterm-in-python/
+def sigterm_handler(signal, frame):
+    print("Received SIGTERM, cleaning up persistent state...")
+    clean_persistent_state()
+    # handle the backgroud threads
+    node.shutdown()
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, sigterm_handler)
+
+
+class RPCTimer:
+    def __init__(self, node_id, function, interval):
+        self.function = function
+        self.interval_range = interval
+        # interval is a tuple of (lower_bound, upper_bound)
+        self.interval = random.randint(interval[0], interval[1]) / 1000
+        self.node_id = node_id
+        self.type = "election" if function.__name__ == "start_election" else "heartbeat"
+        # reference: https://docs.python.org/3/library/threading.html#timer-objects
+        self.timer = Timer(self.interval, self.function)
+
+    def reset_timer(self):
+        self.timer.cancel()
+        self.interval = (
+            random.randint(self.interval_range[0], self.interval_range[1]) / 1000
+        )
+        self.timer = Timer(self.interval, self.function)
+        self.timer.start()
+
+    def stop_timer(self):
+        self.timer.cancel()
+
+
+class Node:
+    def __init__(self, node_id, config, ip, port):
+        self.id = node_id
+        self.ip = ip
+        self.port = port
+        self.config = config
+
+        # message queue and log state
+        self.topics = {}
+        self.log = []
+        self.commit_index = 0
+        self.last_applied = 0
+        self.next_index = {}
+        self.match_index = {}
+
+        # state variables
+        self.current_term = 0
+        self.current_role = "Follower"
+        self.voted_for = None
+        # equivalent to vote_count
+        self.election_votes = {}
+
+        # LOCK, allow for re-entrant locks
+        self.lock = threading.RLock()
+
+        os.makedirs("node", exist_ok=True)
+        # Load persisted state
+        self.load_state()
+        # Rebuild state from log
+        self.rebuild_state()
+
+        self.executor = ThreadPoolExecutor(max_workers=10)
+
+        self.other_nodes = []
+        for i, address in enumerate(self.config["addresses"]):
+            if i != int(self.id):
+                other_node = {
+                    "id": str(i),
+                    "port": address["port"],
+                    "ip": address["ip"].replace("http://", ""),
+                }
+                self.other_nodes.append(other_node)
+
+        self.total_nodes = len(self.other_nodes) + 1
+
+        self.heartbeat_timer = RPCTimer(self.id, self.send_heartbeat, (100, 200))
+        # make timers for election and heartbeat
+        self.election_timer = RPCTimer(self.id, self.start_election, (500, 1000))
+        # start our election timer
+        self.election_timer.timer.start()
+
+    ### Persistent State
+    def save_state(self):
+        """Save persistent state to disk"""
+        with self.lock:
+            persistent_state = {
+                "currentTerm": self.current_term,
+                "votedFor": self.voted_for,
+                "log": self.log,
+            }
+
+        with open(f"node/{self.id}.json", "w") as f:
+            json.dump(persistent_state, f)
+
+    def load_state(self):
+        """Load persistent state from disk"""
+        try:
+            with open(f"node/{self.id}.json", "r") as f:
+                persistent_state = json.load(f)
+
+            with self.lock:
+                self.current_term = persistent_state["currentTerm"]
+                self.voted_for = persistent_state["votedFor"]
+                self.log = persistent_state["log"]
+        except FileNotFoundError:
+            print(f"Node {self.id}: No persisted state found, using defaults")
+
+    def rebuild_state(self):
+        """Replay log entries to rebuild the in-memory state (state machine)"""
+        # Start with a clean state for topics.
+        self.topics = {}
+        for entry in self.log:
+            command = entry.get("command")
+            if command == "ADD_TOPIC":
+                topic = entry.get("topic")
+                if topic and topic not in self.topics:
+                    self.topics[topic] = []
+                    print(f"Node {self.id}: Rebuilt topic {topic}")
+            elif command == "PUT_MESSAGE":
+                topic = entry.get("topic")
+                message = entry.get("message")
+                if topic:
+                    # If the topic doesn't exist, create it.
+                    if topic not in self.topics:
+                        self.topics[topic] = []
+                    self.topics[topic].append(message)
+                    print(
+                        f"Node {self.id}: Rebuilt message for topic {topic}: {message}"
+                    )
+            elif command == "GET_MESSAGE":
+                topic = entry.get("topic")
+                if topic in self.topics and self.topics[topic]:
+                    popped = self.topics[topic].pop(0)
+                    print(
+                        f"Node {self.id}: Replayed GET_MESSAGE for topic {topic}: {popped}"
+                    )
+
+    def shutdown(self):
+        """Shutdown the node"""
+        with self.lock:
+            self.heartbeat_timer.stop_timer()
+            self.election_timer.stop_timer()
+        self.executor.shutdown(wait=False)
+
+    def start_election(self):
+        """Start a new election"""
+        with self.lock:
+            self.current_term += 1
+            self.current_role = "Candidate"
+            # clear the prior votes as we are starting a new election
+            self.election_votes = {self.id: True}
+            # save state before the timer resets
+            self.save_state()
+            self.election_timer.reset_timer()
+        print(f"Node {self.id}: Starting election for term {self.current_term}")
+        # check for a win here in case we are the only node (test case with 1 node)
+        self.check_election_win()
+        # if we haven't won, send out vote requests
+        for each_node in self.other_nodes:
+            self.executor.submit(self.send_vote_request, each_node)
+
+    def check_election_win(self):
+        """Check if we have won the election"""
+        should_become_leader = False
+        majority = (self.total_nodes // 2) + 1
+        with self.lock:
+            # count the votes we have received
+            votes_received = sum(1 for vote in self.election_votes.values() if vote)
+
+            if votes_received >= majority:
+                # set this flag for proper handling of the lock
+                should_become_leader = True
+            # no matter what, lock gets released here
+        if should_become_leader:
+            self.become_leader()
+
+    def become_leader(self):
+        """Transition to the leader state"""
+        with self.lock:
+            if self.current_role == "Leader":
+                return
+            self.current_role = "Leader"
+            # stop the election timer
+            self.election_timer.stop_timer()
+            # initialize next_index and match_index for each node for log replication
+            for each_node in self.other_nodes:
+                # remem
+                self.next_index[each_node["id"]] = len(self.log) + 1
+                self.match_index[each_node["id"]] = 0
+        # send a heartbeat now that we are the new leader
+        self.send_heartbeat()
+
+    def send_heartbeat(self):
+        """Send a heartbeat to all followers"""
+        print(f"Node {self.id}: Sending heartbeat for term {self.current_term}")
+
+        # Submit heartbeat tasks for each follower (using self.other_nodes)
+        for each_node in self.other_nodes:
+            self.executor.submit(self.send_append_entries_to_node, each_node)
+
+        # Reset the heartbeat timer after sending heartbeats
+        with self.lock:
+            # only place where we reset the heartbeat timer, this function keeps getting called by the timer
+            self.heartbeat_timer.reset_timer()
+
+    def handle_vote_request(self, data):
+        """Process a RequestVote RPC from a candidate"""
+        print(f"Node {self.id}: Received vote request: {data}")
+
+        with self.lock:
+            # Extract data from request
+            candidate_term = data.get("term", 0)
+            candidate_id = data.get("candidate_id")
+
+            response = {"term": self.current_term, "vote_granted": False}
+
+            # If candidate's term is less than current term, reject vote
+            if candidate_term < self.current_term:
+                print(
+                    f"Node {self.id}: Rejecting vote - candidate term {candidate_term} < my term {self.current_term}"
+                )
+                return response
+
+            # If candidate's term is greater, update our term and step down
+            if candidate_term > self.current_term:
+                print(
+                    f"Node {self.id}: Updating term from {self.current_term} to {candidate_term}"
+                )
+                self.current_term = candidate_term
+                self.voted_for = None
+                if self.current_role == "Leader":
+                    self.heartbeat_timer.stop_timer()
+                self.current_role = "Follower"
+                self.save_state()
+                self.election_timer.reset_timer()
+
+            # If we haven't voted for anyone in this term yet (or already voted for this candidate)
+            last_log_index = data.get("last_log_index", 0)
+            last_log_term = data.get("last_log_term", 0)
+            if (
+                self.voted_for is None or self.voted_for == candidate_id
+            ) and self.is_candidate_log_up_to_date(last_log_index, last_log_term):
+                print(
+                    f"Node {self.id}: Granting vote to {candidate_id} for term {candidate_term}"
+                )
+                self.voted_for = candidate_id
+                response["vote_granted"] = True
+                self.save_state()
+
+                # Reset election timeout
+                self.election_timer.reset_timer()
+
+            else:
+                print(
+                    f"Node {self.id}: Rejecting vote - already voted for {self.voted_for}"
+                )
+
+            response["term"] = self.current_term
+            return response
+
+    def send_vote_request(self, target_node):
+        """Send a RequestVote RPC to a target node"""
+        try:
+            with self.lock:
+                if self.current_role != "Candidate":
+                    return
+                request_data = {
+                    "term": self.current_term,
+                    "candidate_id": self.id,
+                    "last_log_index": len(self.log),
+                    "last_log_term": self.log[-1]["term"] if self.log else 0,
+                }
+                request_term = self.current_term
+
+            print(f"Node {self.id}: Sending vote request to {target_node['id']}")
+            url = f"http://{target_node['ip']}:{target_node['port']}/request_vote"
+            response = requests.put(url, json=request_data, timeout=1.0)
+
+            if response.status_code == 200:
+                data = response.json()
+                print(f"Node {self.id}: Received vote response: {data}")
+
+                vote_granted = data.get("vote_granted", False)
+                response_term = data.get("term", 0)
+
+                with self.lock:
+                    # if the term has changed, update our term and step down
+                    if response_term > self.current_term:
+                        print(
+                            f"Node {self.id}: Updating term from {self.current_term} to {response_term}"
+                        )
+                        self.current_term = response_term
+                        self.voted_for = None
+                        self.save_state()
+                        if self.current_role == "Leader":
+                            self.heartbeat_timer.stop_timer()
+                        self.current_role = "Follower"
+                        self.election_timer.reset_timer()
+                        return
+
+                    # if we're still a candidate in the same term
+                    if (
+                        self.current_role == "Candidate"
+                        and request_term == self.current_term
+                    ):
+                        if vote_granted:
+                            self.election_votes[target_node["id"]] = True
+                            print(
+                                f"Node {self.id}: Vote granted by {target_node['id']}"
+                            )
+            # we're basically checking if we have won the election after each vote request, and if we have, we become the leader
+            self.check_election_win()
+        except requests.exceptions.RequestException:
+            print(f"Node {self.id}: Error sending vote request to {target_node['id']}")
+
+    ### Append Entries
+    def handle_append_entries(self, data):
+        """Process an AppendEntries RPC from a leader"""
+        with self.lock:
+            leader_term = data.get("term", 0)
+            leader_id = data.get("leader_id")
+            prev_log_index = data.get("prev_log_index", 0)
+            prev_log_term = data.get("prev_log_term", 0)
+            entries = data.get("entries", [])
+            leader_commit = data.get("leader_commit", 0)
+
+            response = {"term": self.current_term, "success": False}
+
+            if leader_term < self.current_term:
+                print(
+                    f"Node {self.id}: Rejecting append entries - leader term {leader_term} < my term {self.current_term}"
+                )
+                return response
+
+            # valid heartbeat
+            self.election_timer.reset_timer()
+            # if leader term is greater, update our term and step down
+            if leader_term > self.current_term:
+                print(
+                    f"Node {self.id}: Updating term from {self.current_term} to {leader_term}"
+                )
+                self.current_term = leader_term
+                self.voted_for = None
+                self.save_state()
+            if self.current_role == "Leader":
+                self.heartbeat_timer.stop_timer()
+            self.current_role = "Follower"
+
+            # Rule 2: check if we have the log entry at prev_log_index and the term matches
+            if prev_log_index > 0:
+                if prev_log_index > len(self.log) or (
+                    len(self.log) >= prev_log_index
+                    and self.log[prev_log_index - 1]["term"] != prev_log_term
+                ):
+                    print(
+                        f"Node {self.id}: Rejecting append entries - log mismatch at index {prev_log_index}"
+                    )
+                    return {"term": self.current_term, "success": False}
+
+            # Rule 3 and 4: now, we've passed the checks so we can start applying the entry!
+            # if the existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
+            if len(entries) > 0:
+                if len(self.log) > prev_log_index:
+                    # truncate the log if our log is longer than the leader's
+                    self.log = self.log[:prev_log_index]
+                self.log.extend(entries)
+
+                self.save_state()
+
+            # Rule 5: update commit index
+            if leader_commit > self.commit_index:
+                old_commit_index = self.commit_index
+                self.commit_index = min(leader_commit, len(self.log))
+                # if the commit index has changed, apply the log entries
+                if old_commit_index != self.commit_index:
+                    self.apply_committed_entries()
+
+            response["term"] = self.current_term
+            response["success"] = True
+
+            return response
+
+    def send_append_entries_to_node(self, target_node):
+        """Send an AppendEntries RPC to a target node"""
+        try:
+            with self.lock:
+                if self.current_role != "Leader":
+                    return
+
+                follower_id = target_node["id"]
+                next_idx = self.next_index.get(follower_id, 1)
+                # this is the index of the log entry immediately preceding new entries
+                prev_log_index = next_idx - 1
+
+                # get the term:
+                prev_log_term = 0
+                if prev_log_index > 0 and prev_log_index <= len(self.log):
+                    prev_log_term = self.log[prev_log_index - 1]["term"]
+
+                # if we have entries to send, get the entries from the log
+                if next_idx <= len(self.log):
+                    entries = self.log[next_idx - 1 :]
+                else:
+                    entries = []
+
+                request_data = {
+                    "term": self.current_term,
+                    "leader_id": self.id,
+                    "prev_log_index": prev_log_index,
+                    "prev_log_term": prev_log_term,
+                    "entries": entries,
+                    "leader_commit": self.commit_index,
+                }
+                leader_term = self.current_term
+
+            print(f"Node {self.id}: Sending append entries to {target_node['id']}")
+            url = f"http://{target_node['ip']}:{target_node['port']}/append_entries"
+            response = requests.put(url, json=request_data, timeout=1.0)
+
+            if response.status_code == 200:
+                data = response.json()
+                print(f"Node {self.id}: Received append entries response: {data}")
+                with self.lock:
+                    if data.get("term", 0) > leader_term:
+                        print(
+                            f"Node {self.id}: Updating term from {self.current_term} to {data['term']}"
+                        )
+                        self.current_term = data["term"]
+                        self.voted_for = None
+                        self.save_state()
+                        if self.current_role == "Leader":
+                            self.heartbeat_timer.stop_timer()
+                        self.current_role = "Follower"
+                        self.election_timer.reset_timer()
+                        return
+                    if (
+                        data.get("success", False)
+                        and self.current_role == "Leader"
+                        and leader_term == self.current_term
+                    ):
+                        if entries:
+                            next_index = prev_log_index + len(entries) + 1
+                            match_index = prev_log_index + len(entries)
+                            self.next_index[target_node["id"]] = next_index
+                            self.match_index[target_node["id"]] = match_index
+                            # update commit index. We call this every heartbeat, but it's only applied if the commit index has changed
+                            self.update_commit_index()
+                    elif (self.current_role == "Leader") and (
+                        leader_term == self.current_term
+                    ):
+                        # decrement the next index and retry
+                        # I can just retry the decrementing here maybe?
+                        if self.next_index.get(target_node["id"], 1) > 1:
+                            self.next_index[target_node["id"]] -= 1
+
+        except requests.exceptions.RequestException:
+            print(
+                f"Node {self.id}: Error sending append entries to {target_node['id']}"
+            )
+
+    def apply_committed_entries(self):
+        """Apply all committed entries to the state machine"""
+        with self.lock:
+            while self.last_applied < self.commit_index:
+                # increment last_applied
+                self.last_applied += 1
+                # get the log entry
+                entry = self.log[self.last_applied - 1]
+                command = entry["command"]
+                print(
+                    f"Node {self.id}: Applying command {command} (entry {self.last_applied})"
+                )
+
+                # apply the command to the state machine
+                if command == "ADD_TOPIC":
+                    topic = entry["topic"]
+                    if topic not in self.topics:
+                        self.topics[topic] = []
+                        print(f"Node {self.id}: Added topic {topic}")
+                elif command == "PUT_MESSAGE":
+                    topic = entry["topic"]
+                    message = entry["message"]
+                    if topic in self.topics:
+                        self.topics[topic].append(message)
+                        print(
+                            f"Node {self.id}: Added message to topic {topic}: {message}"
+                        )
+                elif command == "GET_MESSAGE":
+                    topic = entry["topic"]
+                    if topic in self.topics and len(self.topics[topic]) > 0:
+                        message = self.topics[topic].pop(0)
+                        print(
+                            f"Node {self.id}: Retrieved message from topic {topic}: {message}"
+                        )
+                elif command == "GET_TOPICS":
+                    print(f"Node {self.id}: Read topics list")
+                    pass
+                # if its not changing the state, we don't need to do anything but we should still log it to ensure ordering
+
+    def update_commit_index(self):
+        """Update commit index if there exists an N > commitIndex such that
+        a majority of matchIndex[i] ≥ N and log[N].term == currentTerm"""
+        with self.lock:
+            if self.current_role != "Leader":
+                return
+
+            # Check each index from current commit_index+1 to end of log
+            old_commit_index = self.commit_index
+            for N in range(self.commit_index + 1, len(self.log) + 1):
+                # Only update commit_index for entries from current term
+                if self.log[N - 1]["term"] == self.current_term:
+                    # Count how many servers have this entry (including self)
+                    replicated_count = 1  # Count self
+                    for each_follower in self.match_index:
+                        if self.match_index[each_follower] >= N:
+                            replicated_count += 1
+
+                    # If majority have this entry, update commit_index
+                    if replicated_count > (self.total_nodes // 2):
+                        self.commit_index = N
+                    else:
+                        # If we don't have majority for this entry, we won't for later ones either
+                        break
+
+            # If commit index changed, apply entries
+            if self.commit_index > old_commit_index:
+                print(
+                    f"Node {self.id}: Commit index updated from {old_commit_index} to {self.commit_index}"
+                )
+                self.apply_committed_entries()
+
+    def is_candidate_log_up_to_date(self, last_log_index, last_log_term):
+        """Check if candidate's log is at least as up-to-date as receiver's log"""
+        my_last_log_term = 0
+        my_last_log_index = len(self.log)
+        if self.log:
+            my_last_log_term = self.log[-1]["term"]
+
+        # If the terms are different, the one with the larger term is more up-to-date
+        if last_log_term > my_last_log_term:
+            return True
+        elif last_log_term == my_last_log_term:
+            # If terms are the same, the one with the longer log is more up-to-date
+            return last_log_index >= my_last_log_index
+        return False
+
+    def wait_for_log_commit(self, log_index, timeout=1.0):
+        """Wait until the specified log entry has been committed and applied"""
+        majority = (self.total_nodes // 2) + 1
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            with self.lock:
+                # Check if already committed or can be committed
+                if self.commit_index >= log_index:
+                    return True
+
+                confirmed_count = 1  # Leader counts as confirmed
+                for follower_id in self.match_index:
+                    if self.match_index[follower_id] >= log_index:
+                        confirmed_count += 1
+
+                if confirmed_count >= majority:
+                    self.commit_index = log_index
+                    self.apply_committed_entries()
+                    return True
+
+            time.sleep(0.005)
+
+        return False  # Timeout occurred
+
+
+# RPC Endpoints
+
+
 app = Flask(__name__)
-
-
-# ThreadPoolExecutor to handle sending tasks concurrently
-executor = ThreadPoolExecutor(max_workers=10)
-
-# store topics
-topics = {}
-
-# Raft state
-current_role = "Follower"
-current_term = 0
-last_heartbeat_time = 0
-election_timeout = 0
-leader_id = None
-voted_for = None
-other_nodes = []
-
-# For election voting
-election_votes = {}
-votes_lock = threading.Lock()
-
-# logging
-log = []
-commit_index = 0
-last_applied = 0
-
-# leader volatile state
-next_index = {}
-match_index = {}
-
-
-# Configuration
-HEARTBEAT_INTERVAL = 0.2  # seconds
-MIN_ELECTION_TIMEOUT = 0.3  # seconds
-MAX_ELECTION_TIMEOUT = 0.5  # seconds
-
-# setup the threadpool
-executor = ThreadPoolExecutor(max_workers=10)
-
-
-#########################
-# REST API Endpoints    #
-#########################
-# Only the leader will serve client requests.
 
 
 @app.route("/topic", methods=["PUT"])
 def create_topic():
-    global current_role, leader_id
-    if current_role != "Leader":
-        # If not leader, return failure with leader info if known
-        response = {"success": False}
-        if leader_id is not None:
-            response["leader_id"] = leader_id
-        return jsonify(response), 400
+    # only the leader can create a topic
+    with node.lock:
+        if node.current_role != "Leader":
+            return jsonify({"success": False}), 400
 
-    data = request.json
-    topic = data.get("topic", None)
-    command = {"type": "create_topic", "topic": request.json.get("topic")}
-    log.append()
-
-    # Error handling
+    data = request.get_json()
+    topic = data.get("topic")
     if not topic:
         return jsonify({"success": False}), 400
-    if topic in topics:
-        return jsonify({"success": False}), 400
 
-    topics[topic] = []
+    with node.lock:
+        if topic in node.topics:
+            return jsonify({"success": False}), 409
+        log_index = len(node.log) + 1
+        node.log.append(
+            {"term": node.current_term, "command": "ADD_TOPIC", "topic": topic}
+        )
+        node.save_state()
+
+    node.send_heartbeat()
+    # update commit index
+    if not node.wait_for_log_commit(log_index):
+        # If timeout occurred, return failure
+        return jsonify({"success": False}), 500
+
+    print(f"Node {node.id}: Created topic '{topic}'")
     return jsonify({"success": True}), 201
 
 
 @app.route("/topic", methods=["GET"])
-def get_topics():
-    global current_role, leader_id
-    if current_role != "Leader":
-        # If not leader, return failure with leader info if known
-        response = {"success": False}
-        if leader_id is not None:
-            response["leader_id"] = leader_id
-        return jsonify(response), 400
+def list_topics():
+    with node.lock:
+        if node.current_role != "Leader":
+            return jsonify({"success": False}), 400
 
-    return jsonify({"success": True, "topics": list(topics.keys())}), 200
+        # Just send heartbeats to verify leadership
+        node.send_heartbeat()
+
+        topics = list(node.topics.keys())
+    return jsonify({"success": True, "topics": topics}), 200
 
 
 @app.route("/message", methods=["PUT"])
-def add_message():
-    global current_role, leader_id
-    if current_role != "Leader":
-        # If not leader, return failure with leader info if known
-        response = {"success": False}
-        if leader_id is not None:
-            response["leader_id"] = leader_id
-        return jsonify(response), 400
-
-    data = request.json
-    topic = data.get("topic", None)
-    message = data.get("message", None)
-
+def put_message():
+    # only the leader can put a message
+    with node.lock:
+        if node.current_role != "Leader":
+            return jsonify({"success": False}), 400
+    data = request.get_json()
+    topic = data.get("topic")
+    message = data.get("message")
     if not topic or not message:
         return jsonify({"success": False}), 400
 
-    if topic not in topics:
-        return jsonify({"success": False}), 400
+    with node.lock:
+        if topic not in node.topics:
+            return jsonify({"success": False}), 404
+        log_index = len(node.log) + 1
+        node.log.append(
+            {
+                "command": "PUT_MESSAGE",
+                "topic": topic,
+                "message": message,
+                "term": node.current_term,
+            }
+        )
+        node.save_state()
 
-    topics[topic].append(message)
+    # Trigger replication
+    node.send_heartbeat()
+
+    # Update commit index based on replication status
+    if not node.wait_for_log_commit(log_index):
+        return jsonify({"success": False}), 500
+
+    print(f"Node {node.id}: Added message to topic '{topic}': {message}")
     return jsonify({"success": True}), 201
 
 
 @app.route("/message/<topic>", methods=["GET"])
 def get_message(topic):
-    global current_role, leader_id
-    if current_role != "Leader":
-        # If not leader, return failure with leader info if known
-        response = {"success": False}
-        if leader_id is not None:
-            response["leader_id"] = leader_id
-        return jsonify(response), 400
+    with node.lock:
+        # only the leader can get a message
+        if node.current_role != "Leader":
+            return jsonify({"success": False}), 400
+        if topic not in node.topics or len(node.topics[topic]) == 0:
+            return jsonify({"success": False}), 404
 
-    # Check if topic exists
-    if topic not in topics:
-        return jsonify({"success": False}), 400
+        # Save the message to return before it gets popped
+        message = node.topics[topic][0]
 
-    # Check if topic has messages
-    if not topics[topic]:
-        return jsonify({"success": False}), 400
+        # add to log, so we can pop later
+        log_index = len(node.log) + 1
+        node.log.append(
+            {
+                "command": "GET_MESSAGE",
+                "topic": topic,
+                "term": node.current_term,
+            }
+        )
+        node.save_state()
 
-    # Pop the first message
-    message = topics[topic].pop(0)
+    # Trigger replication
+    node.send_heartbeat()
+    # Update commit index based on replication status
+    if not node.wait_for_log_commit(log_index):
+        return jsonify({"success": False}), 500
+
+    print(f"Node {node.id}: Retrieved message from topic '{topic}': {message}")
     return jsonify({"success": True, "message": message}), 200
 
 
-@app.route("/status", methods=["GET"])
-def status():
-    return jsonify({"role": current_role, "term": current_term}), 200
-
-
-###########################
-# Raft RPC Endpoints     #
-###########################
-
-
-@app.route("/request_vote", methods=["POST"])
+@app.route("/request_vote", methods=["PUT"])
 def handle_request_vote():
-    data = request.json
-    response = request_vote(data)
-    return jsonify(response), 200
+    data = request.get_json()
+    return jsonify(node.handle_vote_request(data)), 200
 
 
-@app.route("/append_entries", methods=["POST"])
-def handle_append_entries():
-    data = request.json
-    response = append_entries(data)
-    return jsonify(response), 200
+@app.route("/append_entries", methods=["PUT"])
+def handle_append_entries_request():
+    data = request.get_json()
+    return jsonify(node.handle_append_entries(data)), 200
 
 
-###########################
-# Log Functionality       #
-###########################
-def apply_command(command):
-    """
-    Applies a command to the log
-    """
-    if command["type"] == "create_topic":
-        if command["topic"] not in topics:
-            topics[command["topic"]] = []
-            return True
-        return False
-    elif command["type"] == "add_message":
-        if command["topic"] not in topics:
-            return False
-        topics[command["topic"]].append(command["message"])
-        return True
-    elif command["type"] == "get_message":
-        if command["topic"] not in topics or not topics[command["topic"]]:
-            return False
-        return topics[command["topic"]].pop(0)
-    return False
-
-
-###########################
-# Raft RPC Functionality  #
-###########################
-def request_vote(data):
-    """
-    Process a request for a vote from another node
-    """
-    # Set global variables to modify within the function
-    global current_role, current_term, voted_for, log, last_heartbeat_time
-
-    candidate_term = data.get("term", 0)
-    candidate_id = data.get("candidate_id")
-
-    print(
-        f"Node {node_id} received vote request from {candidate_id} for term {candidate_term}"
-    )
-
-    # If candidate's term is less than current term, reject
-    if candidate_term < current_term:
-        print(
-            f"Node {node_id} rejected vote: candidate term {candidate_term} < current term {current_term}"
-        )
-        return {"term": current_term, "vote_granted": False}
-
-    # If it's a new term, update our term and consider voting
-    if candidate_term > current_term:
-        current_term = candidate_term
-        voted_for = None  # Reset vote for new term
-        # If we were leader or candidate, step down
-        if current_role != "Follower":
-            print(
-                f"Node {node_id} stepping down to follower due to higher term {candidate_term}"
-            )
-            current_role = "Follower"
-
-    # Decide whether to vote for this candidate. if we've already voted this term, don't vote again
-    if voted_for is None or voted_for == candidate_id:
-        # Vote for this candidate
-        voted_for = candidate_id
-        # Reset election timeout after voting
-        last_heartbeat_time = time.time()
-        reset_election_timeout()
-
-        print(
-            f"Node {node_id} granted vote to {candidate_id} for term {candidate_term}"
-        )
-        return {"term": current_term, "vote_granted": True}
-
-    # Otherwise we have already voted for someone else
-    print(f"Node {node_id} rejected vote: already voted for {voted_for}")
-    return {
-        "term": current_term,
-        "vote_granted": False,
-    }
-
-
-def append_entries(data):
-    """
-    Process an AppendEntries RPC from another node (heartbeat or log entry)
-    """
-    # Process heartbeats and log entries
-    global current_term, current_role, last_heartbeat_time, leader_id, voted_for
-
-    leader_term = data.get("term", 0)
-    leader_id_from_msg = data.get("leader_id")
-
-    # If leader's term is less than current term, reject
-    if leader_term < current_term:
-        print(
-            f"Node {node_id} rejected append entries: leader term {leader_term} < current term {current_term}"
-        )
-        return {
-            "term": current_term,
-            "success": False,
-        }
-
-    # Valid leader message received
-
-    # If leader's term is greater, update our term
-    if leader_term > current_term:
-        current_term = leader_term
-        voted_for = None  # Reset vote for new term
-
-    # Accept this node as leader for our term
-    leader_id = leader_id_from_msg
-
-    # Always step down to follower when receiving valid append entries (can just always step down)
-    if current_role != "Follower":
-        print(
-            f"Node {node_id} stepping down to follower due to valid append entries from {leader_id}"
-        )
-        current_role = "Follower"
-
-    # Update heartbeat time and reset timeout
-    last_heartbeat_time = time.time()
-    reset_election_timeout()
-
-    print(
-        f"Node {node_id} received valid heartbeat from leader {leader_id} for term {leader_term}"
-    )
-
-    # Process log entries (not implemented for this basic version)
-    # For now, just acknowledge the append entries
-    return {
-        "term": current_term,
-        "success": True,
-    }
-
-
-def reset_election_timeout():
-    global election_timeout
-    # Add a timeout of 1.5 to 3 seconds
-    election_timeout = time.time() + random.uniform(
-        MIN_ELECTION_TIMEOUT, MAX_ELECTION_TIMEOUT
-    )
-
-
-#################################
-# Election Timeout and Voting   #
-#################################
-def check_election_timeout():
-    global current_role, election_timeout
-    while True:
-        # Check every 100ms
-        time.sleep(0.1)
-
-        # Start election if we're not a leader and timeout has expired.
-        # our heartbeat resets election timeout anyway so we just compare current time to election timeout
-        current_time = time.time()
-        if current_role != "Leader" and current_time > election_timeout:
-            print(
-                f"Node {node_id} election timeout at time {current_time}, timeout was {election_timeout}"
-            )
-            start_election()
-
-
-def start_election():
-    """
-    When a node times out, it starts an election.
-    - Increment term
-    - Become candidate
-    - Vote for self
-    - Send vote requests to other nodes
-    """
-    global current_role, current_term, voted_for, node_id, election_votes, leader_id
-
-    if current_role == "Leader":
-        return
-
-    # Increment term and become a candidate
-    current_term += 1
-    current_role = "Candidate"
-    voted_for = node_id
-
-    # Reset election timeout
-    reset_election_timeout()
-
-    print(f"Node {node_id} starting election for term {current_term}")
-    # Clear previous election votes
-    with votes_lock:
-        election_votes.clear()
-        election_votes[node_id] = True  # Vote for self
-
-        if len(other_nodes) == 0:
-            current_role = "Leader"
-            leader_id = node_id
-            print(
-                f"Node {node_id} became leader for term {current_term} (single-node cluster)"
-            )
-            become_leader()
-
-    # Request votes from all other nodes
-    for node in other_nodes:
-        executor.submit(request_vote_from_node, node)
-
-
-def request_vote_from_node(node):
-    """Send a vote request to a single node"""
-    global current_term, node_id, election_votes, current_role, voted_for
-    try:
-        url = f"http://{node['ip']}:{node['port']}/request_vote"
-        print(f"Node {node_id} sending vote request to {url}")
-
-        response = requests.post(
-            url,
-            json={
-                "term": current_term,
-                "candidate_id": node_id,
-                "last_log_index": len(log),
-                "last_log_term": 0 if not log else log[-1].get("term", 0),
-            },
-            timeout=1.0,
-        )
-        if response.status_code == 200:
-            data = response.json()
-            # If we get a higher term, update our term and step down
-            if data.get("term", 0) > current_term:
-                current_term = data.get("term")
-                current_role = "Follower"
-                voted_for = None
-                print(
-                    f"Node {node_id} stepping down due to higher term from {node['id']}"
-                )
-                return
-
-            vote_granted = data.get("vote_granted", False)
-            if vote_granted:
-                print(
-                    f"Node {node_id} received vote from {node['id']} for term {current_term}"
-                )
-            else:
-                print(
-                    f"Node {node_id} did not receive vote from {node['id']} for term {current_term}"
-                )
-            should_become_leader = False
-            with votes_lock:
-                election_votes[node["id"]] = vote_granted
-                votes_recieved = sum(vote for vote in election_votes.values() if vote)
-                total_nodes = len(other_nodes) + 1  # include self
-                if votes_recieved > total_nodes // 2:
-                    print(
-                        f"Node {node_id} won election with {votes_recieved} votes out of {total_nodes}"
-                    )
-                    should_become_leader = True
-
-            if should_become_leader:
-                print(f"Node {node_id} became leader for term {current_term}")
-                become_leader()
-
-    except requests.exceptions.RequestException as e:
-        print(f"Error requesting vote from {node['id']}: {e}")
-
-
-def become_leader():
-    """Transition to leader state"""
-    global current_role, leader_id, node_id
-
-    if current_role != "Candidate":
-        return
-
-    current_role = "Leader"
-    leader_id = node_id
-
-    print(f"Node {node_id} became leader for term {current_term}")
-
-    # Send initial heartbeat to establish authority
-    send_heartbeat_to_all()
-
-
-##########################
-# Heartbeat Functionality#
-##########################
-
-
-def send_heartbeat_to_node(node):
-    """
-    Send a heartbeat to a single node (empty AppendEntries)
-    """
-    global current_term, node_id, current_role, voted_for
-    try:
-        url = f"http://{node['ip']}:{node['port']}/append_entries"
-        response = requests.post(
-            url,
-            json={
-                "term": current_term,
-                "leader_id": node_id,
-                "prev_log_index": 0,
-                "prev_log_term": 0,
-                "entries": [],  # Empty for heartbeat
-                "leader_commit": 0,
-            },
-            timeout=1.0,
-        )
-        if response.status_code == 200:
-            # we do this for every server, so we need to check if we are still the leader
-            data = response.json()
-            if data.get("term", 0) > current_term:
-                current_term = data.get("term")
-                current_role = "Follower"
-                voted_for = None
-                print(
-                    f"Node {node_id} stepping down due to higher term from {node['id']}"
-                )
-
-    except requests.exceptions.RequestException as e:
-        print(f"Error sending heartbeat to {node['id']}: {e}")
-
-
-def send_heartbeat_to_all():
-    """Send a heartbeat to all other nodes (empty AppendEntries)"""
-    global current_role
-
-    if current_role != "Leader":
-        return
-
-    for node in other_nodes:
-        executor.submit(send_heartbeat_to_node, node)
-
-
-def heartbeat_loop():
-    """Periodically send heartbeats if this node is the leader"""
-    while True:
-        time.sleep(HEARTBEAT_INTERVAL / 2)  # Send heartbeats at twice the interval rate
-        if current_role == "Leader":
-            send_heartbeat_to_all()
-
-
-def main():
-    global last_heartbeat_time, node_id, other_nodes
-
-    if len(sys.argv) != 3:
-        print("Usage: python3 src/node.py path_to_config index")
-        sys.exit(1)
-
-    config_path = sys.argv[1]
-    node_index = int(sys.argv[2])
-    node_id = str(node_index)
-
-    with open(config_path, "r") as f:
-        config = json.load(f)
-
-    for i, address in enumerate(config["addresses"]):
-        if i != node_index:
-            node_info = {
-                "id": str(i),
-                "port": address["port"],
-                "ip": address["ip"].replace("http://", ""),
-            }
-
-            other_nodes.append(node_info)
-
-    node_address = config["addresses"][node_index]
-    node_port = node_address["port"]
-    node_ip = node_address["ip"].replace("http://", "")
-
-    # Set initial election timeout and heartbeat time
-    reset_election_timeout()
-    last_heartbeat_time = time.time()
-
-    # Start background threads
-    threading.Thread(target=check_election_timeout, daemon=True).start()
-    threading.Thread(target=heartbeat_loop, daemon=True).start()
-
-    print(f"Node {node_id} starting on {node_ip}:{node_port}")
-
-    # Start Flask server for client interactions
-    app.run(host=node_ip, port=node_port, debug=False)
+@app.route("/status", methods=["GET"])
+def get_status():
+    with node.lock:
+        role = node.current_role
+        term = node.current_term
+    return jsonify({"role": role, "term": term}), 200
 
 
 if __name__ == "__main__":
-    main()
+    import sys, json
+
+    if len(sys.argv) != 3:
+        sys.exit("Usage: python3 node.py path_to_config index")
+
+    path_to_config = sys.argv[1]
+    index = int(sys.argv[2])
+
+    with open(path_to_config, "r") as f:
+        config = json.load(f)
+
+    node_info = config["addresses"][index]
+    node = Node(
+        node_id=index,
+        config=config,
+        ip=node_info["ip"].replace("http://", ""),
+        port=node_info["port"],
+    )
+
+    app.run(host=node.ip, port=node.port)
