@@ -1,4 +1,4 @@
-# MPCS 52040 Final Project (RAFT)
+# Technical Report - Raft Message Queue Implementation
 
 ## Introduction
 
